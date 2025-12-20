@@ -17,7 +17,7 @@ api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:
     st.sidebar.info("No OPENAI_API_KEY found — using local HuggingFace models for embeddings and generation by default.")
 
-# Configure Streamlit page
+# Configure Streamlit page - minimal for speed
 st.set_page_config(
     page_title="Chat with PDF",
     page_icon="📄",
@@ -25,23 +25,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS
-st.markdown("""
-    <style>
-    .main {
-        padding: 2rem;
-    }
-    .stChatMessage {
-        background-color: #f0f2f6;
-        border-radius: 8px;
-        padding: 1rem;
-        margin: 0.5rem 0;
-    }
-    </style>
-""", unsafe_allow_html=True)
 
-
-@st.cache_resource
 def initialize_session_state():
     """Initialize Streamlit session state"""
     if "vector_store_manager" not in st.session_state:
@@ -54,7 +38,7 @@ def initialize_session_state():
         st.session_state.pdf_name = None
 
 
-def load_pdf(uploaded_file, store_type: str = "faiss", embedding_type: str = "hf", hf_model_name: str = "all-MiniLM-L6-v2"):
+def load_pdf(uploaded_file, store_type: str = "faiss", embedding_type: str = "hf", hf_model_name: str = "all-MiniLM-L6-v2", chunk_size: int = 400, k: int = 2):
     """Load and process PDF file"""
     try:
         with st.spinner("Processing PDF..."):
@@ -65,8 +49,8 @@ def load_pdf(uploaded_file, store_type: str = "faiss", embedding_type: str = "hf
             with open(temp_path, "wb") as f:
                 f.write(uploaded_file.getbuffer())
             
-            # Load and split document
-            loader = PDFDocumentLoader(chunk_size=1000, chunk_overlap=200)
+            # Load and split document with configurable chunk size for speed
+            loader = PDFDocumentLoader(chunk_size=chunk_size, chunk_overlap=chunk_size//4)
             documents = loader.load_and_split(temp_path)
             
             # Create vector store using local HF embeddings by default to avoid OpenAI quota issues
@@ -78,12 +62,10 @@ def load_pdf(uploaded_file, store_type: str = "faiss", embedding_type: str = "hf
             )
             vector_store_manager.create_vector_store(documents)
             
-            # Create RAG chain
+            # Create RAG chain using requested number of context docs (k)
             rag_chain = RAGChain(
                 vector_store=vector_store_manager.vector_store,
-                model_name="gpt-3.5-turbo",
-                temperature=0.7,
-                k=4
+                k=k
             )
             
             st.session_state.vector_store_manager = vector_store_manager
@@ -158,8 +140,20 @@ def sidebar():
     store_type = "faiss"
     # Embedding source: using local HF models by default to avoid OpenAI quota errors
     embedding_source = "hf"
-    hf_model = st.sidebar.text_input("HF model name (embeddings)", value="all-MiniLM-L6-v2")
+    hf_model = st.sidebar.text_input("HF model name (embeddings)", value="all-MiniLM-L6-v2", help="Lighter models: all-MiniLM-L6-v2 (fast), all-distilroberta-v1 (faster)")
     
+    # Fixed chunk size for faster, consistent processing
+    CHUNK_SIZE = 400
+
+    # Context docs (k) - keep this configurable for tradeoff between speed/accuracy
+    k = st.sidebar.slider(
+        "Context Docs",
+        min_value=1,
+        max_value=5,
+        value=2,
+        help="Fewer = faster (recommended: 1-2)"
+    )
+
     # PDF upload
     st.sidebar.markdown("---")
     st.sidebar.subheader("📤 Upload PDF")
@@ -168,30 +162,21 @@ def sidebar():
         type="pdf",
         help="Upload a PDF to chat with"
     )
-    
+
     if uploaded_file is not None:
-        load_pdf(uploaded_file, store_type=store_type, embedding_type=embedding_source, hf_model_name=(hf_model or "all-MiniLM-L6-v2"))
+        load_pdf(
+            uploaded_file,
+            store_type=store_type,
+            embedding_type=embedding_source,
+            hf_model_name=(hf_model or "all-MiniLM-L6-v2"),
+            chunk_size=CHUNK_SIZE,
+            k=k,
+        )
     
     # Model configuration
     st.sidebar.markdown("---")
     st.sidebar.subheader("🤖 Model Settings")
-    
-    temperature = st.sidebar.slider(
-        "Temperature",
-        min_value=0.0,
-        max_value=1.0,
-        value=0.7,
-        step=0.1,
-        help="Controls randomness of responses (0=deterministic, 1=random)"
-    )
-    
-    k = st.sidebar.slider(
-        "Number of Context Documents",
-        min_value=1,
-        max_value=10,
-        value=4,
-        help="How many relevant documents to use for answering"
-    )
+    st.sidebar.markdown("Deterministic extractive QA (no temperature control).")
     
     # Clear chat history
     st.sidebar.markdown("---")

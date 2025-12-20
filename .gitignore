@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Environment variables
 .env
 .env.local
@@ -28,3 +29,35 @@ vector_store/
 
 # Cache
 .streamlit/
+=======
+# Environment variables
+.env
+.env.local
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Project specific
+data/uploads/
+vector_store/
+*.pdf
+.DS_Store
+
+# Cache
+.streamlit/
+>>>>>>> e410ac6d1afea2f6dc3c09e2a169702dd94477e3
