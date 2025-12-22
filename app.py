@@ -7,6 +7,8 @@ from utils.document_loader import PDFDocumentLoader
 from utils.vector_store import VectorStoreManager
 from utils.rag_chain import RAGChain
 import tempfile
+import hashlib
+from typing import List, Dict
 
 # Load environment variables from .env file in the current directory
 env_path = Path(__file__).parent / ".env"
@@ -17,7 +19,7 @@ api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:
     st.sidebar.info("No OPENAI_API_KEY found — using local HuggingFace models for embeddings and generation by default.")
 
-# Configure Streamlit page
+# Configure Streamlit page - minimal for speed
 st.set_page_config(
     page_title="Chat with PDF",
     page_icon="📄",
@@ -25,23 +27,35 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS
-st.markdown("""
+# Themed frontend (light professional) matching provided screenshot
+st.markdown(
+    """
     <style>
-    .main {
-        padding: 2rem;
-    }
-    .stChatMessage {
-        background-color: #f0f2f6;
-        border-radius: 8px;
-        padding: 1rem;
-        margin: 0.5rem 0;
-    }
+    /* Light professional theme */
+    html, body, [class*="css"] { background: #f8fafc !important; color: #0f172a !important; }
+    .stApp, .main, .block-container { background: transparent !important; color: #0f172a !important; }
+    .stSidebar { background: #f1f5f9 !important; color: #0f172a !important; padding: 18px 16px !important; }
+    .stSidebar .stMarkdown, .stSidebar .stText { color: #0f172a !important; }
+    .stButton>button, button[kind] { background: #ffffff !important; color: #0f172a !important; border: 1px solid #e6eef8 !important; border-radius: 10px !important; }
+    .card, .streamlit-expanderHeader { background: #ffffff; color: #0f172a; border-radius:12px; box-shadow: 0 2px 8px rgba(15,23,42,0.06); padding: 14px; border: 1px solid #e6eef8; }
+    .stAlert { background: #ecfdf5 !important; color: #065f46 !important; border-left: 4px solid #bbf7d0 !important; border-radius:8px !important; padding:10px 12px !important; }
+    .stExpander { background: #fff !important; border-radius: 8px; }
+    [data-testid="stFileUploader"] { background:#fff; border-radius:8px; border:1px solid #e6eef8; padding:12px; }
+    .stTextInput>div, .stTextArea>div { background: #fbfdff !important; color: #0f172a !important; border: 1px solid #e6eef8 !important; border-radius: 999px !important; padding: 10px 14px !important; }
+    .stChatInput>div { background:#f1f5f9 !important; border-radius:999px !important; padding:8px 12px !important; }
+    a { color: #2563eb !important; }
+    .small-muted { color: #64748b !important; }
+    .title { font-weight:700; color:#0f172a; font-size:28px; }
+    /* Make success messages and toasts match screenshot */
+    .stSuccess { background: #ecfdf5 !important; color: #065f46 !important; }
+    /* Tweak markdown code blocks */
+    pre, code { background: #f8fafc; color: #0f172a; border: 1px solid #e6eef8; padding:8px; border-radius:8px; }
     </style>
-""", unsafe_allow_html=True)
+    """,
+    unsafe_allow_html=True,
+)
 
 
-@st.cache_resource
 def initialize_session_state():
     """Initialize Streamlit session state"""
     if "vector_store_manager" not in st.session_state:
@@ -52,22 +66,28 @@ def initialize_session_state():
         st.session_state.messages = []
     if "pdf_name" not in st.session_state:
         st.session_state.pdf_name = None
+    if "_split_cache" not in st.session_state:
+        st.session_state["_split_cache"] = {}
 
 
-def load_pdf(uploaded_file, store_type: str = "faiss", embedding_type: str = "hf", hf_model_name: str = "all-MiniLM-L6-v2"):
+def load_pdf(uploaded_file, store_type: str = "faiss", embedding_type: str = "hf", hf_model_name: str = "all-MiniLM-L6-v2", chunk_size: int = 400, k: int = 2):
     """Load and process PDF file"""
     try:
         with st.spinner("Processing PDF..."):
             # Save uploaded file to temporary location
-            temp_dir = tempfile.mkdtemp()
-            temp_path = os.path.join(temp_dir, uploaded_file.name)
-            
-            with open(temp_path, "wb") as f:
-                f.write(uploaded_file.getbuffer())
-            
-            # Load and split document
-            loader = PDFDocumentLoader(chunk_size=1000, chunk_overlap=200)
-            documents = loader.load_and_split(temp_path)
+            file_bytes = uploaded_file.getbuffer().tobytes()
+            file_hash = hashlib.sha256(file_bytes).hexdigest()
+
+            # Use cached split if available to avoid re-processing same file
+            cache_key = hashlib.sha256(file_bytes).hexdigest()
+            if cache_key in st.session_state.get("_split_cache", {}):
+                documents_serialized = st.session_state["_split_cache"][cache_key]
+            else:
+                documents_serialized = _cached_split_pdf(file_bytes, uploaded_file.name, chunk_size)
+                # store in session cache (small memory cost)
+                st.session_state["_split_cache"][cache_key] = documents_serialized
+            # Reconstruct Documents
+            documents = [Document(page_content=d["page_content"], metadata=d.get("metadata", {})) for d in documents_serialized]
             
             # Create vector store using local HF embeddings by default to avoid OpenAI quota issues
             vector_store_manager = VectorStoreManager(
@@ -78,12 +98,10 @@ def load_pdf(uploaded_file, store_type: str = "faiss", embedding_type: str = "hf
             )
             vector_store_manager.create_vector_store(documents)
             
-            # Create RAG chain
+            # Create RAG chain using requested number of context docs (k)
             rag_chain = RAGChain(
                 vector_store=vector_store_manager.vector_store,
-                model_name="gpt-3.5-turbo",
-                temperature=0.7,
-                k=4
+                k=k
             )
             
             st.session_state.vector_store_manager = vector_store_manager
@@ -95,6 +113,7 @@ def load_pdf(uploaded_file, store_type: str = "faiss", embedding_type: str = "hf
             
     except Exception as e:
         st.error(f"❌ Error loading PDF: {str(e)}")
+        st.error("Check the Streamlit terminal for detailed logs.")
 
 
 def chat_interface():
@@ -106,7 +125,14 @@ def chat_interface():
     st.subheader(f"📄 Chatting with: {st.session_state.pdf_name}")
     
     # Display chat messages
-    for message in st.session_state.messages:
+    ui_mode = st.session_state.get("ui_mode", "Professional")
+    if ui_mode == "Classic":
+        recent = st.session_state.messages
+    else:
+        # Limit to last 20 in Professional mode to avoid rendering lag
+        recent = st.session_state.messages[-20:]
+
+    for message in recent:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
     
@@ -131,9 +157,12 @@ def chat_interface():
                     # Display source documents
                     with st.expander("📚 Source Documents"):
                         for i, doc in enumerate(source_docs, 1):
-                            st.markdown(f"**Document {i}:**")
-                            st.markdown(f"*Page: {doc.metadata.get('page', 'N/A')}*")
-                            st.markdown(f"```\n{doc.page_content[:500]}...\n```")
+                            if ui_mode == "Classic":
+                                st.markdown(f"**Document {i}:**")
+                                st.markdown(f"*Page: {doc.metadata.get('page', 'N/A')}*")
+                                st.markdown(f"```\n{doc.page_content[:500]}...\n```")
+                            else:
+                                st.markdown(f"<div class='card'>**Document {i}:**<div class='small-muted'>Page: {doc.metadata.get('page', 'N/A')}</div>\n\n{doc.page_content[:800]}...</div>", unsafe_allow_html=True)
                     
                     # Add assistant message to chat history
                     st.session_state.messages.append(
@@ -158,8 +187,20 @@ def sidebar():
     store_type = "faiss"
     # Embedding source: using local HF models by default to avoid OpenAI quota errors
     embedding_source = "hf"
-    hf_model = st.sidebar.text_input("HF model name (embeddings)", value="all-MiniLM-L6-v2")
+    hf_model = st.sidebar.text_input("HF model name (embeddings)", value="all-MiniLM-L6-v2", help="Lighter models: all-MiniLM-L6-v2 (fast), all-distilroberta-v1 (faster)")
     
+    # Fixed chunk size for faster, consistent processing
+    CHUNK_SIZE = 400
+
+    # Context docs (k) - keep this configurable for tradeoff between speed/accuracy
+    k = st.sidebar.slider(
+        "Context Docs",
+        min_value=1,
+        max_value=5,
+        value=2,
+        help="Fewer = faster (recommended: 1-2)"
+    )
+
     # PDF upload
     st.sidebar.markdown("---")
     st.sidebar.subheader("📤 Upload PDF")
@@ -168,62 +209,70 @@ def sidebar():
         type="pdf",
         help="Upload a PDF to chat with"
     )
-    
     if uploaded_file is not None:
-        load_pdf(uploaded_file, store_type=store_type, embedding_type=embedding_source, hf_model_name=(hf_model or "all-MiniLM-L6-v2"))
-    
-    # Model configuration
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("🤖 Model Settings")
-    
-    temperature = st.sidebar.slider(
-        "Temperature",
-        min_value=0.0,
-        max_value=1.0,
-        value=0.7,
-        step=0.1,
-        help="Controls randomness of responses (0=deterministic, 1=random)"
-    )
-    
-    k = st.sidebar.slider(
-        "Number of Context Documents",
-        min_value=1,
-        max_value=10,
-        value=4,
-        help="How many relevant documents to use for answering"
-    )
-    
-    # Clear chat history
-    st.sidebar.markdown("---")
-    if st.sidebar.button("🗑️ Clear Chat History", use_container_width=True):
-        st.session_state.messages = []
-        st.success("Chat history cleared!")
-    
-    # Information
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("ℹ️ About")
-    st.sidebar.info(
-        """
-        **Chat with PDF** uses RAG (Retrieval-Augmented Generation) to:
-        - Load and process PDF documents
-        - Create embeddings using OpenAI
-        - Store them in FAISS or Chroma
-        - Answer questions based on document content
-        """
-    )
+        load_pdf(
+            uploaded_file,
+            store_type=store_type,
+            embedding_type=embedding_source,
+            hf_model_name=hf_model,
+            chunk_size=CHUNK_SIZE,
+            k=k,
+        )
 
 
 def main():
     """Main application"""
     initialize_session_state()
-    
-    # Header
-    st.title("📄 Chat with Your PDF")
-    st.markdown("*Powered by LangChain, OpenAI, and Vector Databases*")
-    
+
+    ui_mode = st.session_state.get("ui_mode", "Professional")
+
+    # Inject CSS only for Professional mode
+    if ui_mode == "Professional":
+        st.markdown(
+            """
+            <style>
+            @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&display=swap');
+            html, body, [class*="css"]  { font-family: 'Inter', sans-serif; }
+            .stApp { background-color: #f7fafc; }
+            .title { color: #0f172a; font-weight:600; }
+            .card { background: white; border-radius:10px; padding:16px; box-shadow: 0 2px 6px rgba(15,23,42,0.06); }
+            .small-muted { color: #64748b; font-size:0.9rem }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        # Professional header
+        col1, col2 = st.columns([1, 3])
+        with col1:
+            st.markdown("<div style='font-size:32px'>📄</div>", unsafe_allow_html=True)
+        with col2:
+            st.markdown("<div class='title' style='font-size:20px'>Chat with Your PDF</div>", unsafe_allow_html=True)
+            st.markdown("<div class='small-muted'>Answer questions directly from your PDF — fast, deterministic, and grounded in your document.</div>", unsafe_allow_html=True)
+    else:
+        # Classic header (simple)
+        st.title("📄 Chat with Your PDF")
+        st.markdown("Ask questions and get extractive answers from your document.")
+
     # Layout
     sidebar()
+    # Main content
     chat_interface()
+
+
+@st.cache_data(max_entries=10)
+def _cached_split_pdf(file_bytes: bytes, filename: str, chunk_size: int) -> List[Dict]:
+    """Write bytes to temp file, split using PDFDocumentLoader and return serializable list of dicts."""
+    import tempfile as _temp
+    tmp = _temp.mkdtemp()
+    path = os.path.join(tmp, filename)
+    with open(path, "wb") as f:
+        f.write(file_bytes)
+
+    loader = PDFDocumentLoader(chunk_size=chunk_size, chunk_overlap=max(50, chunk_size // 8))
+    docs = loader.load_and_split(path)
+    serial = [{"page_content": d.page_content, "metadata": d.metadata} for d in docs]
+    return serial
 
 
 if __name__ == "__main__":
